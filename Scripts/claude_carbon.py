@@ -113,11 +113,26 @@ def decode_project_path(dirname):
 
 # --- Extraction --------------------------------------------------------------
 
+def iter_transcripts(projects_dir):
+    """Yield (project_dir_name, path) for every transcript under projects_dir.
+
+    Two layouts exist: main sessions at <project>/<session-id>.jsonl and
+    subagent sessions one level deeper, at
+    <project>/<session-id>/subagents/agent-*.jsonl. Both are billed, so both
+    are counted."""
+    patterns = (
+        os.path.join(projects_dir, "*", "*.jsonl"),
+        os.path.join(projects_dir, "*", "*", "subagents", "*.jsonl"),
+    )
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            rel = os.path.relpath(path, projects_dir)
+            yield rel.split(os.sep)[0], path
+
+
 def iter_messages(projects_dir):
     """Yield one dict per assistant message carrying usage data."""
-    pattern = os.path.join(projects_dir, "*", "*.jsonl")
-    for path in sorted(glob.glob(pattern)):
-        project = os.path.basename(os.path.dirname(path))
+    for project, path in iter_transcripts(projects_dir):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 line = line.strip()
