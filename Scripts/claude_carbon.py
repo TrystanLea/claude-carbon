@@ -6,19 +6,49 @@ energy/carbon analysis.
 Reads the same source of truth as the macOS app: the assistant messages with
 `usage` blocks in ~/.claude/projects/<encoded-project-path>/<session-id>.jsonl
 
-Methodology (mirrors ClaudeCarbon/Resources/Methodology.json and
-Services/EnergyCalculator.swift, see METHODOLOGY.md):
+Two methodologies are available (--method):
+
+"token" (default) mirrors ClaudeCarbon/Resources/Methodology.json and
+Services/EnergyCalculator.swift, see METHODOLOGY.md. Every token costs the
+same, with cache tokens weighted by Anthropic's pricing ratios:
 
     effective_input = input_tokens
                     + int(cache_read_input_tokens  * 0.10)   # cheap: cache lookup
                     + int(cache_creation_input_tokens * 1.25) # extra: cache write
     total_tokens    = effective_input + output_tokens
     energy_J        = total_tokens * joules_per_token[model] * PUE
+
+"physical" costs the three things the hardware actually does. Decoding an
+output token reads the whole model once per step (shared across the batch)
+plus the sequence's own KV cache, so its cost grows with context length.
+Prefilling new input (input + cache creation) is compute-bound and cheap
+per token. Reading a cached token is only a memory transfer, and is almost
+free; the real cost of a long context is paid per output token instead.
+
+    context         = input + cache_read + cache_creation      # tokens attended
+    decode_J        = output_tokens * (out_base + out_ctx * context)
+    prefill_J       = (input_tokens + cache_creation_tokens) * prefill
+    load_J          = cache_read_tokens * cache_load
+    energy_J        = (decode_J + prefill_J + load_J) * PUE
+
+The physical constants (PHYSICAL) are first-principles estimates for a
+frontier model served in batches of a few dozen sequences on an 8-GPU
+node, scaled per model with the same ratios as the token method. Cache
+reads are 97% of a typical Claude Code history's raw tokens, so the two
+methods differ by roughly 5x in total; see METHODOLOGY.md.
+
+Either way:
+
     energy_Wh       = energy_J / 3600
     carbon_gCO2e    = energy_Wh * carbon_intensity_gCO2e_per_kWh / 1000
 
 Results are reported as totals (kWh, kgCO2e) and as average daily rates
 (kWh/day, kgCO2e/day) over the period the data covers.
+
+Active time is derived, not logged: the transcripts carry only a timestamp
+per event (user prompt, assistant message, tool result...), so a session's
+active time is the sum of gaps between consecutive events, ignoring any gap
+longer than --idle-gap minutes. Average power (W) is energy / active time.
 
 These are educational approximations, good to roughly an order of magnitude.
 
@@ -29,6 +59,9 @@ Usage:
     ./claude_carbon.py --csv out.csv            # per-message rows
     ./claude_carbon.py --carbon-intensity 162   # UK 2024 grid instead of US
     ./claude_carbon.py --period-days 30         # fix the /day denominator
+    ./claude_carbon.py --by-project --idle-gap 10  # count gaps up to 10 min
+    ./claude_carbon.py --method physical        # decode/prefill cost model
+    ./claude_carbon.py --method physical --physical-param out_base=8
 """
 
 import argparse
@@ -51,13 +84,42 @@ JOULES_PER_TOKEN = {
                     #                   always reasons (thinking cannot be
                     #                   disabled), so 2x the Opus figure.
 }
-DEFAULT_MODEL = "sonnet"
+DEFAULT_MODEL = "opus"
 
 PUE = 1.2                     # data centre power usage effectiveness
 CARBON_INTENSITY = 384.0      # gCO2e/kWh, US grid average 2024 (EPA)
 
 CACHE_READ_WEIGHT = 0.10      # cache_read_input_tokens energy multiplier
 CACHE_CREATE_WEIGHT = 1.25    # cache_creation_input_tokens energy multiplier
+
+# --- "physical" method constants --------------------------------------------
+#
+# IT-level joules for the reference (opus) tier; PUE is applied on top.
+# Derived from node power x time / batch size for an ~15 kW 8-GPU node
+# serving a few dozen sequences, and 2 x active parameters FLOPs for prefill.
+# Each is an order-of-magnitude estimate; the plausible range is in brackets.
+PHYSICAL = {
+    "out_base": 4.0,     # J per output token: weight-read share of a decode
+                         # step, amortised over the batch          [3 - 10]
+    "out_ctx": 10e-6,    # J per output token per context token: reading the
+                         # sequence's KV cache plus attention      [5 - 40 uJ]
+    "prefill": 0.5,      # J per input or cache-creation token: compute-bound
+                         # forward pass, 2 x active params FLOPs   [0.3 - 1.5]
+    "cache_load": 1e-4,  # J per cache-read token per message: moving the KV
+                         # entry back into accelerator memory. Generous upper
+                         # bound; rounds to zero in practice.      [0 - 1e-4]
+}
+# Per-model multipliers on the reference constants, same ratios as
+# JOULES_PER_TOKEN (larger models read more weights, more layers of KV).
+PHYSICAL_SCALE = {
+    "haiku": 0.15,
+    "sonnet": 0.5,
+    "opus": 1.0,
+    "fable": 2.0,
+}
+METHODS = ("token", "physical")
+
+IDLE_GAP_MINUTES = 5.0        # gaps longer than this do not count as active time
 
 # Household comparisons (EnergyEstimate.swift): 10W LED bulb, 20Wh phone
 # battery, 60W laptop, 1000W microwave.
@@ -130,8 +192,11 @@ def iter_transcripts(projects_dir):
             yield rel.split(os.sep)[0], path
 
 
-def iter_messages(projects_dir):
-    """Yield one dict per assistant message carrying usage data."""
+def iter_messages(projects_dir, events=None):
+    """Yield one dict per assistant message carrying usage data.
+
+    If `events` (a dict) is given, every timestamped record is also appended
+    to events[(project_dir, session_id)] so active time can be derived."""
     for project, path in iter_transcripts(projects_dir):
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -142,7 +207,13 @@ def iter_messages(projects_dir):
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if not isinstance(rec, dict) or rec.get("type") != "assistant":
+                if not isinstance(rec, dict):
+                    continue
+                if events is not None:
+                    ts = parse_timestamp(rec.get("timestamp"))
+                    if ts and rec.get("sessionId"):
+                        events[(project, rec["sessionId"])].append(ts)
+                if rec.get("type") != "assistant":
                     continue
                 msg = rec.get("message")
                 if not isinstance(msg, dict):
@@ -188,9 +259,23 @@ def dedupe(messages):
     return out
 
 
+def active_gaps(timestamps, idle_gap_s):
+    """Yield (end_timestamp, seconds) for each gap between consecutive events
+    that is no longer than idle_gap_s. Longer gaps mean the user walked away
+    and are not counted."""
+    prev = None
+    for ts in sorted(timestamps):
+        if prev is not None:
+            gap = (ts - prev).total_seconds()
+            if 0 < gap <= idle_gap_s:
+                yield ts, gap
+        prev = ts
+
+
 # --- Calculation -------------------------------------------------------------
 
-def compute(msg, joules_per_token, pue, carbon_intensity):
+def compute(msg, joules_per_token, pue, carbon_intensity,
+            method="token", physical=PHYSICAL, physical_scale=PHYSICAL_SCALE):
     effective_input = (
         msg["input_tokens"]
         + int(msg["cache_read_tokens"] * CACHE_READ_WEIGHT)
@@ -198,7 +283,22 @@ def compute(msg, joules_per_token, pue, carbon_intensity):
     )
     total = effective_input + msg["output_tokens"]
     jpt = joules_per_token.get(msg["model"], joules_per_token[DEFAULT_MODEL])
-    energy_wh = total * jpt * pue / 3600.0
+    decode_j = prefill_j = load_j = 0.0
+    if method == "token":
+        energy_j = total * jpt * pue
+    elif method == "physical":
+        scale = physical_scale.get(msg["model"], physical_scale[DEFAULT_MODEL])
+        context = (msg["input_tokens"] + msg["cache_read_tokens"]
+                   + msg["cache_create_tokens"])
+        decode_j = msg["output_tokens"] * scale * (
+            physical["out_base"] + physical["out_ctx"] * context)
+        prefill_j = ((msg["input_tokens"] + msg["cache_create_tokens"])
+                     * scale * physical["prefill"])
+        load_j = msg["cache_read_tokens"] * physical["cache_load"]
+        energy_j = (decode_j + prefill_j + load_j) * pue
+    else:
+        raise ValueError(f"unknown method: {method}")
+    energy_wh = energy_j / 3600.0
     carbon_g = energy_wh * carbon_intensity / 1000.0
     msg = dict(msg)
     msg.update(
@@ -209,6 +309,9 @@ def compute(msg, joules_per_token, pue, carbon_intensity):
             + msg["cache_read_tokens"] + msg["cache_create_tokens"]
         ),
         joules_per_token=jpt,
+        decode_wh=decode_j * pue / 3600.0,
+        prefill_wh=prefill_j * pue / 3600.0,
+        load_wh=load_j * pue / 3600.0,
         energy_wh=energy_wh,
         carbon_g=carbon_g,
     )
@@ -216,7 +319,8 @@ def compute(msg, joules_per_token, pue, carbon_intensity):
 
 
 class Totals:
-    __slots__ = ("messages", "raw_tokens", "tokens", "energy_wh", "carbon_g")
+    __slots__ = ("messages", "raw_tokens", "tokens", "energy_wh", "carbon_g",
+                 "active_s")
 
     def __init__(self):
         self.messages = 0
@@ -224,29 +328,43 @@ class Totals:
         self.tokens = 0
         self.energy_wh = 0.0
         self.carbon_g = 0.0
+        self.active_s = 0.0
+
+    @property
+    def avg_watts(self):
+        return self.energy_wh * 3600.0 / self.active_s if self.active_s else 0.0
+
+    tokens_field = "billable_tokens"   # what the 'tokens' column reports
 
     def add(self, r):
         self.messages += 1
         self.raw_tokens += r["raw_tokens"]
-        self.tokens += r["billable_tokens"]
+        self.tokens += r[self.tokens_field]
         self.energy_wh += r["energy_wh"]
         self.carbon_g += r["carbon_g"]
 
 
-def fmt_row(label, t, width, period_days, rates=True):
+TOKENS_LABEL = "eff. tokens"
+
+
+def fmt_row(label, t, width, period_days, rates=True, time=True):
     row = (f"  {label:<{width}} {t.messages:>7,}  {t.tokens:>15,}  "
            f"{t.energy_wh / 1000:>10.4f}  {t.carbon_g / 1000:>10.4f}")
     if rates:
         row += (f"  {t.energy_wh / 1000 / period_days:>10.4f}"
                 f"  {t.carbon_g / 1000 / period_days:>11.4f}")
+    if time:
+        row += f"  {t.active_s / 3600:>8.2f}  {t.avg_watts:>7.1f}"
     return row
 
 
-def header(width, rates=True):
-    row = (f"  {'':<{width}} {'msgs':>7}  {'eff. tokens':>15}  "
+def header(width, rates=True, time=True):
+    row = (f"  {'':<{width}} {'msgs':>7}  {TOKENS_LABEL:>15}  "
            f"{'kWh':>10}  {'kgCO2e':>10}")
     if rates:
         row += f"  {'kWh/day':>10}  {'kgCO2e/day':>11}"
+    if time:
+        row += f"  {'hours':>8}  {'avg W':>7}"
     return row
 
 
@@ -270,8 +388,22 @@ def main():
     p.add_argument("--period-days", type=float, default=None, metavar="D",
                    help="days to divide totals by for the /day rates "
                         "(default: the span actually covered by the data)")
+    p.add_argument("--method", choices=METHODS, default="token",
+                   help="'token': every token costs J/token, cache tokens "
+                        "weighted by pricing ratios (the app's method). "
+                        "'physical': decode cost grows with context, prefill "
+                        "is cheap, cache reads are nearly free")
     p.add_argument("--joules-per-token", metavar="M=J", action="append", default=[],
-                   help="override J/token, e.g. --joules-per-token opus=4.0")
+                   help="[token] override J/token, e.g. --joules-per-token opus=4.0")
+    p.add_argument("--physical-param", metavar="K=V", action="append", default=[],
+                   help="[physical] override a reference constant: "
+                        + ", ".join(f"{k}={v:g}" for k, v in PHYSICAL.items()))
+    p.add_argument("--physical-scale", metavar="M=X", action="append", default=[],
+                   help="[physical] override a per-model multiplier, "
+                        "e.g. --physical-scale fable=1.5")
+    p.add_argument("--idle-gap", type=float, default=IDLE_GAP_MINUTES,
+                   metavar="MIN", help="gaps between events longer than this "
+                                       "(minutes) are not counted as active time")
     p.add_argument("--no-dedupe", action="store_true",
                    help="do not collapse streaming duplicates by message id")
     args = p.parse_args()
@@ -286,8 +418,33 @@ def main():
             jpt[name.strip().lower()] = float(value)
         except ValueError:
             sys.exit(f"error: bad --joules-per-token value: {override!r}")
+    physical = dict(PHYSICAL)
+    for override in args.physical_param:
+        try:
+            name, value = override.split("=", 1)
+            name = name.strip().lower()
+            if name not in physical:
+                raise ValueError
+            physical[name] = float(value)
+        except ValueError:
+            sys.exit(f"error: bad --physical-param value: {override!r} "
+                     f"(expected one of {', '.join(PHYSICAL)})")
+    physical_scale = dict(PHYSICAL_SCALE)
+    for override in args.physical_scale:
+        try:
+            name, value = override.split("=", 1)
+            physical_scale[name.strip().lower()] = float(value)
+        except ValueError:
+            sys.exit(f"error: bad --physical-scale value: {override!r}")
 
-    messages = list(iter_messages(args.projects_dir))
+    global TOKENS_LABEL
+    if args.method == "physical":
+        # Weighted token counts are not the energy driver here; show raw.
+        TOKENS_LABEL = "raw tokens"
+        Totals.tokens_field = "raw_tokens"
+
+    events = defaultdict(list)
+    messages = list(iter_messages(args.projects_dir, events))
     if not args.no_dedupe:
         messages = dedupe(messages)
 
@@ -304,11 +461,25 @@ def main():
                 continue
             if m["timestamp"] < cutoff:
                 continue
-        rows.append(compute(m, jpt, args.pue, args.carbon_intensity))
+        rows.append(compute(m, jpt, args.pue, args.carbon_intensity,
+                            args.method, physical, physical_scale))
 
     if not rows:
         print("No assistant messages with usage data found.")
         return
+
+    # Active time, attributed to session / project / day by the gap's end.
+    idle_gap_s = args.idle_gap * 60.0
+    active_by_session = defaultdict(float)
+    active_by_project = defaultdict(float)
+    active_by_day = defaultdict(float)
+    for (project, sid), stamps in events.items():
+        if cutoff is not None:
+            stamps = [t for t in stamps if t >= cutoff]
+        for ts, secs in active_gaps(stamps, idle_gap_s):
+            active_by_session[sid] += secs
+            active_by_project[decode_project_path(project)] += secs
+            active_by_day[ts.astimezone().strftime("%Y-%m-%d")] += secs
 
     grand = Totals()
     by_model = defaultdict(Totals)
@@ -333,22 +504,48 @@ def main():
             first_ts = ts if first_ts is None or ts < first_ts else first_ts
             last_ts = ts if last_ts is None or ts > last_ts else last_ts
 
+    for k, secs in active_by_session.items():
+        if k in by_session:
+            by_session[k].active_s = secs
+    for k, secs in active_by_project.items():
+        if k in by_project:
+            by_project[k].active_s = secs
+    for k, secs in active_by_day.items():
+        if k in by_day:
+            by_day[k].active_s = secs
+    grand.active_s = sum(t.active_s for t in by_project.values())
+
     print(f"\nClaude Code energy estimate  ({args.projects_dir})")
     if first_ts and last_ts:
         print(f"Period: {first_ts.astimezone():%Y-%m-%d %H:%M} "
               f"to {last_ts.astimezone():%Y-%m-%d %H:%M}")
-    print(f"Assumptions: PUE {args.pue}, grid {args.carbon_intensity:g} gCO2e/kWh, "
-          f"J/token " + ", ".join(f"{k} {v:g}" for k, v in sorted(jpt.items())))
+    print(f"Method: {args.method}")
+    if args.method == "token":
+        print(f"Assumptions: PUE {args.pue}, grid {args.carbon_intensity:g} gCO2e/kWh, "
+              f"J/token " + ", ".join(f"{k} {v:g}" for k, v in sorted(jpt.items())))
+    else:
+        print(f"Assumptions: PUE {args.pue}, grid {args.carbon_intensity:g} gCO2e/kWh")
+        print(f"  per output token     {physical['out_base']:g} J + "
+              f"{physical['out_ctx'] * 1e6:g} uJ x context tokens")
+        print(f"  per prefilled token  {physical['prefill']:g} J "
+              f"(input + cache creation)")
+        print(f"  per cache-read token {physical['cache_load']:g} J")
+        print(f"  model scale          " + ", ".join(
+            f"{k} {v:g}x" for k, v in sorted(physical_scale.items())))
     if undated:
         print(f"Note: {undated} message(s) without a timestamp excluded by --days")
 
     print("\nTokens reported by the API")
     print(f"  input                {raw_input:>18,}")
     print(f"  output               {raw_output:>18,}")
-    print(f"  cache read           {raw_cache_read:>18,}  (weighted {CACHE_READ_WEIGHT:g}x)")
-    print(f"  cache creation       {raw_cache_create:>18,}  (weighted {CACHE_CREATE_WEIGHT:g}x)")
+    weights = args.method == "token"
+    print(f"  cache read           {raw_cache_read:>18,}"
+          + (f"  (weighted {CACHE_READ_WEIGHT:g}x)" if weights else ""))
+    print(f"  cache creation       {raw_cache_create:>18,}"
+          + (f"  (weighted {CACHE_CREATE_WEIGHT:g}x)" if weights else ""))
     print(f"  total raw            {grand.raw_tokens:>18,}")
-    print(f"  energy-effective     {grand.tokens:>18,}")
+    if args.method == "token":
+        print(f"  energy-effective     {grand.tokens:>18,}")
 
     # Denominator for the /day rates: the span the data actually covers,
     # floored at an hour so one short session cannot blow the rate up.
@@ -368,7 +565,20 @@ def main():
           f"({grand.energy_wh:,.2f} Wh)")
     print(f"  carbon               {grand.carbon_g / 1000:>18,.4f} kgCO2e "
           f"({grand.carbon_g:,.2f} g)")
+    if args.method == "physical":
+        decode = sum(r["decode_wh"] for r in rows)
+        prefill = sum(r["prefill_wh"] for r in rows)
+        load = sum(r["load_wh"] for r in rows)
+        print(f"    decoding output    {decode / 1000:>18,.4f} kWh "
+              f"({decode / grand.energy_wh:.0%})")
+        print(f"    prefilling input   {prefill / 1000:>18,.4f} kWh "
+              f"({prefill / grand.energy_wh:.0%})")
+        print(f"    loading cache      {load / 1000:>18,.4f} kWh "
+              f"({load / grand.energy_wh:.0%})")
     print(f"  equivalent to        {household_comparison(grand.energy_wh)}")
+    print(f"  active time          {grand.active_s / 3600:>18,.2f} hours "
+          f"(gaps over {args.idle_gap:g} min not counted)")
+    print(f"  average power        {grand.avg_watts:>18,.1f} W while active")
 
     print(f"\nAverage rate over {period_days:,.2f} days ({period_note})")
     print(f"  energy               "
@@ -378,17 +588,19 @@ def main():
     print(f"  annualised           "
           f"{grand.carbon_g / 1000 / period_days * 365:>18,.2f} kgCO2e/year")
 
-    def section(title, mapping, sort_key=None, limit=None, rates=True):
+    def section(title, mapping, sort_key=None, limit=None, rates=True, time=True):
         keys = sorted(mapping, key=sort_key) if sort_key else sorted(mapping)
         if limit:
             keys = keys[:limit]
         width = max(len(str(k)) for k in keys)
         print(f"\n{title}")
-        print(header(width, rates))
+        print(header(width, rates, time))
         for k in keys:
-            print(fmt_row(str(k), mapping[k], width, period_days, rates))
+            print(fmt_row(str(k), mapping[k], width, period_days, rates, time))
 
-    section("By model", by_model, sort_key=lambda k: -by_model[k].energy_wh)
+    # Active time is per session, not per message, so it cannot be split by model.
+    section("By model", by_model, sort_key=lambda k: -by_model[k].energy_wh,
+            time=False)
     if args.by_day:
         # Each row already covers exactly one day, so a /day column is noise.
         section("By day", by_day, rates=False)
@@ -406,7 +618,8 @@ def main():
         fields = ["timestamp", "session_id", "project_path", "raw_model", "model",
                   "input_tokens", "output_tokens", "cache_read_tokens",
                   "cache_create_tokens", "effective_input_tokens",
-                  "billable_tokens", "joules_per_token", "energy_wh", "carbon_g"]
+                  "billable_tokens", "joules_per_token", "decode_wh",
+                  "prefill_wh", "load_wh", "energy_wh", "carbon_g"]
         with open(args.csv, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
             w.writeheader()

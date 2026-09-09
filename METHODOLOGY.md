@@ -219,6 +219,55 @@ Carbon = 0.117 × 384 / 1000 = 0.045 gCO2e
 Carbon (g) = (Tokens × J/token × PUE / 3600) × (Carbon intensity / 1000)
 ```
 
+## Alternative: Physical Cost Model (CLI only)
+
+The token method above charges every token the same, with cache tokens
+weighted by Anthropic's pricing ratios. `Scripts/claude_carbon.py --method physical`
+offers an alternative built from what the serving hardware actually does.
+It is not yet used by the macOS app.
+
+### Why
+
+In a typical Claude Code history, cache-read tokens are about 97% of all raw
+tokens, and after the 0.1× weighting they still drive around three quarters of
+the token-method energy. But cache-read pricing mostly pays for accelerator
+memory *capacity* (holding a long context resident), not joules. Physically, a
+cached token costs a memory read per decode step, on the order of microjoules,
+not the 0.2-0.4 J the token method assigns. The token method also charges
+prefill (input and cache creation) at the same rate as decode, when prefill is
+compute-bound and several times cheaper per token.
+
+### Model
+
+Three costs, in IT-level joules for the Opus tier, multiplied by PUE:
+
+| Component | Formula | Reference value | Plausible range |
+|-----------|---------|-----------------|-----------------|
+| Decode | output_tokens × (out_base + out_ctx × context) | 4 J + 10 µJ/context token | 3-10 J, 5-40 µJ |
+| Prefill | (input + cache_creation) × prefill | 0.5 J | 0.3-1.5 J |
+| Cache load | cache_read × cache_load | 0.0001 J | 0-0.0001 J |
+
+where `context = input + cache_read + cache_creation` is the number of tokens
+each output token attends over. Per-model multipliers keep the token method's
+ratios: Haiku 0.15×, Sonnet 0.5×, Opus 1×, Fable 2×.
+
+**Derivation**: an 8-GPU inference node draws roughly 15 kW and serves a few
+dozen sequences at once. A decode step takes 15-25 ms, so node power × step
+time ÷ batch size gives 2-14 J per output token, of which the sequence's own
+KV-cache read and attention is the context-dependent part. Prefill is 2 × active
+parameters in FLOPs at realistic accelerator efficiency, 0.3-1.5 J per token.
+Reloading a KV entry into accelerator memory is a memory transfer of 100-400 KB
+per token, well under 0.1 mJ.
+
+### Effect
+
+On the same history the physical method gives roughly 5× less energy than the
+token method, and an average draw of a few hundred watts per active stream,
+rising to 1-2 kW during multi-agent bursts. Both methods remain order-of-magnitude
+estimates. The model size, batch size and hardware behind Claude are not
+public, so the reference constants can be overridden with `--physical-param`
+and `--physical-scale`.
+
 ## Household Comparison Methodology
 
 Abstract energy numbers are hard to grasp. We convert Wh values to relatable household equivalents.
@@ -356,6 +405,11 @@ Help us validate estimates:
 - Share real-world usage patterns for output multiplier calibration
 
 ## Version History
+
+- **v1.3** (2026-09-09): Physical cost model (CLI only)
+  - Added `--method physical` to `Scripts/claude_carbon.py`: decode cost grows with
+    context length, prefill is cheap, cache reads are nearly free
+  - Documented why pricing ratios overstate cache-read energy by ~50×
 
 - **v1.2** (2025-12-18): External research validation
   - Added cross-validation section comparing estimates to published research
